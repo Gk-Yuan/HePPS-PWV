@@ -7,9 +7,13 @@ from collections import Counter
 from tqdm import tqdm
 
 from hepps_dataset import HePPSDataset
-from hepps_model   import HePPSNet
+from hepps_model import HePPSMixed, HePPSGRU
+from utils import *
 
 def main():
+
+    hepps_set_seeds(114514)
+
     # 1) Device detection
     if torch.cuda.is_available():
         device = torch.device('cuda')
@@ -19,9 +23,9 @@ def main():
         device = torch.device('cpu')
 
     # 2) Hyperparameters
-    BATCH_SIZE    = 128
+    BATCH_SIZE    = 32
     NUM_EPOCHS    = 10
-    LEARNING_RATE = 1e-4
+    LEARNING_RATE = 1e-3
 
     # 3) Dataset + DataLoader
     file_ids = [
@@ -57,13 +61,20 @@ def main():
     }
 
     # 5) Model, Loss, Optimizer, Scheduler, AMP scaler
-    model = HePPSNet(
-        cnn_channels=[16, 32],
-        gru_hidden=64,
-        gru_layers=1,
-        bidirectional=False,
-        dropout=0.0,
-        num_classes=5
+    # model = HePPSMixed(
+    #     cnn_channels=[16, 32],
+    #     gru_hidden=64,
+    #     gru_layers=1,
+    #     bidirectional=False,
+    #     dropout=0.0,
+    #     num_classes=5
+    # ).to(device)
+
+    model = HePPSGRU(
+        input_dim=1,
+        hidden_dim=128,
+        layer_dim=2,
+        output_dim=5
     ).to(device)
 
     criterion = nn.CrossEntropyLoss()
@@ -71,15 +82,14 @@ def main():
         model.parameters(),
         lr=LEARNING_RATE,
         # weight_decay=1e-5
-        )
+    )
+        
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', patience=3, factor=0.5
     )
 
-
-    # def normalize_label(fid):
-    #     parts = fid.rsplit('_',1)
-    #     return parts[0] if len(parts)==2 and parts[1].isdigit() else fid
+    for name, param in model.named_parameters():
+        print(f"Layer: {name}, Size: {param.size()}, Values: \n{param.data}\n")
 
     # 6) Training loop
     for epoch in tqdm(range(1, NUM_EPOCHS + 1)):
@@ -89,22 +99,23 @@ def main():
 
         total   = 0
 
-        for i, (x, lengths, labels) in enumerate(loader, start=1):
+        for i, (x, _, labels) in enumerate(loader, start=1):
             x = x.to(device)
-            y = torch.tensor([base_map[l] for l in labels ],
-                            device=device, 
-                            dtype=torch.long)
+            y = torch.tensor(
+                [base_map[l] for l in labels],
+                device=device, 
+                dtype=torch.long
+            )
 
             optimizer.zero_grad()
-            logits = model(x)
-            loss   = criterion(logits, y)
+            out = model(x)
+            loss = criterion(out, y)
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
             # accumulate for reporting
             total_loss += loss.item() * x.size(0)
-            preds = logits.argmax(dim=1)
+            preds = out.argmax(dim=1)
             correct += (preds == y).sum().item()
             total   += x.size(0)
 
@@ -123,20 +134,23 @@ def main():
         tqdm.write(f"→ Epoch {epoch} done: Loss {epoch_loss:.4f}, Acc {epoch_acc:5.2f}%\n")
         scheduler.step(epoch_loss)
 
+        # for name, param in model.named_parameters():
+        #     print(f"Layer: {name}, Size: {param.size()}, Values: \n{param.data}\n")
+
     print("Training complete.")
     model.eval()
     with torch.no_grad():
         # grab one batch
-        x_batch, labels = next(iter(loader))
+        x_batch, _, labels = next(iter(loader))
         x_batch = x_batch.to(device)
         y_true = [base_map[l] for l in labels]
-        logits = model(x_batch)
-        probs  = torch.softmax(logits, dim=1)
+        out = model(x_batch)
+        probs  = torch.softmax(out, dim=1)
         preds  = probs.argmax(dim=1).cpu().tolist()
 
     # print them side by side
     for i, (t, p, pr) in enumerate(zip(labels, preds, probs.cpu().tolist())):
-        print(f"  Sample {i:2d} | true: {y_true:15s} | pred: {p:<2d} | probs: {pr}")
+        print(f"  Sample {i:2d} | true: {y_true:<2d} | pred: {p:<2d} | probs: {pr}")
 
 if __name__ == "__main__":
     main()

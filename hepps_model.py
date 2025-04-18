@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-class HePPSNet(nn.Module):
+class HePPSMixed(nn.Module):
     def __init__(self,
                  cnn_channels=[16, 32],
                  gru_hidden=64,
@@ -17,30 +17,30 @@ class HePPSNet(nn.Module):
             # 1st conv layer
             nn.Conv1d(1, cnn_channels[0], kernel_size=16, stride=1, padding=2), # (batch, 16, seq)
             nn.Sigmoid(),
-            nn.AvgPool1d(4),                                                    # (batch, 16, seq/4)
+            nn.MaxPool1d(4),                                                    # (batch, 16, seq/4)
             # 2nd conv layer
             nn.Conv1d(cnn_channels[0], cnn_channels[1], kernel_size=16, stride=1, padding=2),   # (batch, 32, seq/4)
             nn.Sigmoid(),
-            nn.AvgPool1d(4),                                                    # (batch, 32, seq/16)
+            nn.MaxPool1d(4),                                                    # (batch, 32, seq/16)
             # 3rd conv layer
             nn.Conv1d(cnn_channels[1], cnn_channels[1], kernel_size=16, stride=1, padding=2),  # (batch, 32, seq/16)
             nn.Sigmoid(),
-            nn.AvgPool1d(2),                                                    # (batch, 32, seq/32)
+            nn.MaxPool1d(2),                                                    # (batch, 32, seq/32)
         )
         # Finger encoder reduces sequence length by 3 -> 3 (total factor 9)
         self.encoder_finger = nn.Sequential(
             # 1st conv layer
             nn.Conv1d(1, cnn_channels[0], kernel_size=16, stride=1, padding=2), # (batch, 16, seq)
             nn.Sigmoid(),
-            nn.AvgPool1d(4),                                                    # (batch, 16, seq/4)
+            nn.MaxPool1d(4),                                                    # (batch, 16, seq/4)
             # 2nd conv layer
             nn.Conv1d(cnn_channels[0], cnn_channels[1], kernel_size=16, stride=1, padding=2),   # (batch, 32, seq/4)
             nn.Sigmoid(),
-            nn.AvgPool1d(4),                                                    # (batch, 32, seq/16)
+            nn.MaxPool1d(4),                                                    # (batch, 32, seq/16)
             # 3rd conv layer
             nn.Conv1d(cnn_channels[1], cnn_channels[1], kernel_size=16, stride=1, padding=2),  # (batch, 32, seq/16)
             nn.Sigmoid(),
-            nn.AvgPool1d(2),                                                    # (batch, 32, seq/32)
+            nn.MaxPool1d(2),                                                    # (batch, 32, seq/32)
         )
         # === GRU Modules ===
         # Input to each GRU: sequence of length seq_len/32 for wrist and seq_len/32 for finger,
@@ -68,7 +68,7 @@ class HePPSNet(nn.Module):
             nn.Softmax(dim=1)
         )
 
-    def forward(self, x, length):
+    def forward(self, x):
         # x: (batch, seq_len, 2)  -- channels last
         # Split channels
         wrist = x[:, :, 0].unsqueeze(1)   # -> (batch, 1, seq_len)
@@ -93,6 +93,29 @@ class HePPSNet(nn.Module):
         # Concatenate wrist + finger features
         combined = torch.cat((w_last, f_last), dim=1)  # -> (batch, hidden*factor*2)
 
-        merged = torch.cat([combined, length], dim=1)     # (batch, hidden*factor*2 + 1)
+        merged = torch.cat([combined], dim=1)     # (batch, hidden*factor*2)
         logits = self.classifier(merged)                  # (batch, num_classes)
         return logits
+
+class HePPSGRU(nn.Module):
+    def __init__(self, input_dim, hidden_dim, layer_dim, output_dim):
+        super().__init__()
+        
+        self.gru_w = nn.GRU(input_dim, hidden_dim, layer_dim, batch_first=True)
+        self.gru_f = nn.GRU(input_dim, hidden_dim, layer_dim, batch_first=True)
+
+        self.fc = nn.Linear(hidden_dim * 2, output_dim)
+        self.softmax = nn.LogSoftmax(dim=1)
+
+    def forward(self, x):
+        # x: (batch, seq_len, 2)
+        w = x[..., 0].unsqueeze(2)  # (batch, seq_len, 1)
+        f = x[..., 1].unsqueeze(2)  # (batch, seq_len, 1)
+
+        out_w, _ = self.gru_w(w)  # (batch, seq_len, hidden_dim)
+        out_f, _ = self.gru_f(f)  # (batch, seq_len, hidden_dim)
+
+        out = torch.cat((out_w[:, -1, :], out_f[:, -1, :]), dim=1)  # (batch, hidden_dim*2)
+        out = self.fc(out)
+        out = self.softmax(out)
+        return out
