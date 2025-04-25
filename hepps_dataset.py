@@ -5,8 +5,10 @@ from collections import defaultdict
 
 import numpy as np
 import torch
+import glob
 from torch.utils.data import Dataset
 from scipy.signal import find_peaks, butter, sosfiltfilt, resample
+from enum import Enum
 import matplotlib.pyplot as plt
 
 class HePPSDataset(Dataset):
@@ -28,7 +30,6 @@ class HePPSDataset(Dataset):
     """
 
     def __init__(self, 
-                 file_identifiers, 
                  root='./data', 
                  sampling_rate=100000, 
                  target_length=80000,
@@ -55,7 +56,6 @@ class HePPSDataset(Dataset):
             segment_offset (float): Time offset (in seconds) to subtract from each peak index when defining segments.
             transform (callable, optional): A transformation to apply on each sample.
         """
-        self.file_identifiers = file_identifiers
         self.root = root
         self.sampling_rate = sampling_rate
         self.target_length = target_length
@@ -72,34 +72,42 @@ class HePPSDataset(Dataset):
         self.normalize_wrist_factor = normalize_wrist_factor
 
         self.segments = []  # List to store full segments (each a 2D array with shape [L, 2])
-        self.labels = []    # List to store corresponding condition labels
+        self.labels = []
         self.original_lengths = []
+        self.pwv_by_label = defaultdict(list)
 
         # Process all files upon initialization.
         self._process_all_files()
 
-    def _load_file(self, file_identifier):
-        """
-        Loads a text file using np.loadtxt, skipping the first 6 rows.
-        Constructs the full file path by joining self.root with the filename pattern:
-            'finger_vs_wrist0403_' + file_identifier + '.txt'
-        Extracts and returns a dictionary with:
-            - 'timestamps': first column,
-            - 'wrist': second column,
-            - 'finger': third column.
-        """
+    def _load_all_data(self):
+        self.data_list = []
         try:
-            file_path = os.path.join(self.root, 'finger_vs_wrist0403_' + file_identifier + '.txt')
-            data = np.loadtxt(file_path, skiprows=6)
-            print(f"Loaded {file_path} with shape {data.shape}")
-            return {
-                'timestamps': data[:, 0],
-                'wrist': data[:, 2],
-                'finger': data[:, 1]
-            }
+            file_pattern = os.path.join(self.root, 'finger_vs_wrist*.txt')
+            txt_files = glob.glob(file_pattern)
+
+            for file_path in txt_files:
+                try:
+                    data = np.loadtxt(file_path, skiprows=6)
+                    filename = os.path.basename(file_path)
+                    label = filename.rsplit('_', 1)[-1].replace('.txt', '')
+
+                    print(f"Loaded {file_path} with shape {data.shape}")
+
+                    self.data_list.append({
+                        'label': label,
+                        'timestamps': data[:, 0],
+                        'wrist': data[:, 2],
+                        'finger': data[:, 1]
+                    })
+                except Exception as e:
+                    print(f"Error loading {file_path}: {e}")
+
         except Exception as e:
-            print(f"Error loading {file_path}: {e}")
-            return None
+            print(f"Failed to scan directory {self.root}: {e}")
+
+        # Create label-to-integer mapping using Enum
+        unique_labels = sorted(set(entry['label'] for entry in self.data_list))
+        self.LabelEnum = Enum('LabelEnum', {label: idx for idx, label in enumerate(unique_labels)})
 
     def _find_peaks(self, signal, distance_sec):
         """
@@ -139,120 +147,150 @@ class HePPSDataset(Dataset):
     def _normalize_signal(self, segment, factor):
         normalized_signal = segment / factor
         return normalized_signal
+    
+    def _ensure_alternating(self, peaks, troughs):
+        """Return a list of trough indices that alternate with peaks."""
+        combined = sorted([(p, 'peak') for p in peaks] +
+                        [(t, 'trough') for t in troughs],
+                        key=lambda x: x[0])
+
+        alternating = []
+        for idx, typ in combined:
+            if not alternating or alternating[-1][1] != typ:
+                alternating.append((idx, typ))
+
+        while alternating and alternating[0][1] != 'trough':
+            alternating.pop(0)
+
+        return [idx for idx, typ in alternating if typ == 'trough']
+    
+    def _extract_segments(
+            self,
+            label: str,
+            wrist_sig: np.ndarray,
+            finger_sig: np.ndarray,
+            troughs: list[int],
+            do_resample: bool = True      
+    ):
+        """
+        Cut wrist/finger signals into segments bracketed by consecutive troughs.
+
+        Parameters
+        ----------
+        label : str
+            Condition label for every segment in this file.
+        wrist_sig, finger_sig : np.ndarray
+            Filtered 1‑D signals for wrist and finger.
+        troughs : list[int]
+            Indices of trough positions (already alternating / cleaned).
+        do_resample : bool, default True
+            If True, resample every segment to `self.target_length`.
+            If False, keep the raw segment length.
+        """
+        for i in range(len(troughs) - 1):
+            interval = troughs[i + 1] - troughs[i]
+            dyn_off  = int(self.segment_offset * interval)
+            s = max(troughs[i]   - dyn_off, 0)
+            e = min(troughs[i+1] - dyn_off, len(wrist_sig))
+
+            w_seg = wrist_sig[s:e]
+            f_seg = finger_sig[s:e]
+            resample_factor = len(w_seg) / self.target_length
+
+            if do_resample:
+                w_seg = self._resample_signal(w_seg)
+                f_seg = self._resample_signal(f_seg)
+
+            w_seg = self._normalize_signal(w_seg, self.normalize_wrist_factor)
+            f_seg = self._normalize_signal(f_seg, self.normalize_finger_factor)
+
+            self.segments.append(np.stack((w_seg, f_seg), axis=-1))
+            self.labels.append(label)
+            self.original_lengths.append(resample_factor)
+
+    def _remove_outliers(self):
+        """3‑sigma filter per label; updates self.segments / self.labels."""
+        grouped = defaultdict(list)
+        for seg, lab in zip(self.segments, self.labels):
+            grouped[lab].append(seg)
+
+        keep_seg, keep_lab = [], []
+        for lab, segs in grouped.items():
+            arr = np.array(segs)                 # (N,L,2)
+            mean = arr.mean(axis=0)              # (L,2)
+            std  = arr.std(axis=0)
+            low, high = mean - 3*std, mean + 3*std
+
+            for seg in segs:
+                if np.all((seg >= low) & (seg <= high)):
+                    keep_seg.append(seg)
+                    keep_lab.append(lab)
+
+        self.segments, self.labels = keep_seg, keep_lab
+        print(f"Outlier removal: retained {len(keep_seg)} segments.")
 
     def _process_all_files(self):
+        self._load_all_data()                    
+        for file in self.data_list:         
+            label   = file['label']
+            wrist   = file['wrist']            
+            finger  = file['finger']
+            timestamps = file['timestamps']
+            wrist = self._apply_butterworth(wrist,  self.filter_cutoff_wrist)
+            finger = self._apply_butterworth(finger, self.filter_cutoff_finger)
+
+            detect = finger if self.sensor_type == 'finger' else wrist
+            peaks, _   = self._find_peaks( detect,          self.distance_sec)
+            troughs,_  = self._find_peaks(-detect,          self.distance_sec)
+
+            clean_troughs = self._ensure_alternating(peaks, troughs)
+            self._extract_segments(label, wrist, finger, clean_troughs)
+        self._remove_outliers()
+
+    # ------------------------------------------------------------------
+    #  PUBLIC: compute raw PWV (no filtering, no resampling)
+    # ------------------------------------------------------------------
+    def compute_pwv(self, max_delay_samples: int = 10_000) -> dict:
         """
-        Processes each file from self.file_identifiers:
-        1. Loads the file using _load_file, which returns a dictionary containing timestamps,
-            wrist, and finger data.
-        2. Applies the Butterworth filter to both wrist and finger signals.
-        3. Selects one sensor (specified by self.sensor_type) for peak detection.
-        4. Detects peaks and troughs (using the prominence parameter) and enforces an alternating pattern.
-        5. Converts the segment offset from seconds to samples.
-        6. Extracts full segments from both sensor channels between (trough - offset) and (next trough - offset)
-            and resamples them.
-        7. After all segments (for a given condition) are collected, groups segments by condition and, for each group,
-            computes the per-timepoint mean and std (with the assumption that every segment has been resampled to a fixed length).
-            Any segment with any value outside [mean - 3·std, mean + 3·std] (computed per time index and per channel) is discarded.
+        Return {label: [δ₁, δ₂, …]} where each δ is the wrist→finger delay
+        **in seconds**.  A pair is kept if 0 < delay < max_delay_samples.
         """
-        # For each file (identified by its file_identifier, e.g., "rest", "exercise", etc.)
-        for file_identifier in self.file_identifiers:
-            data_dict = self._load_file(file_identifier)
-            if data_dict is None:
-                continue
+        pwv_by_label = defaultdict(list)
 
-            # Load raw data.
-            timestamps = data_dict['timestamps']
-            wrist_signal = data_dict['wrist']
-            finger_signal = data_dict['finger']
+        for entry in self.data_list:
+            label  = entry["label"]
+            wrist  = entry["wrist"]
+            finger = entry["finger"]
 
-            # Apply Butterworth filtering to both signals.
-            filtered_wrist_signal = self._apply_butterworth(wrist_signal, self.filter_cutoff_wrist)
-            filtered_finger_signal = self._apply_butterworth(finger_signal, self.filter_cutoff_finger)
+            f_peaks, _ = self._find_peaks(finger, self.distance_sec)
+            w_peaks, _ = self._find_peaks(wrist,  self.distance_sec)
 
-            # Use the chosen sensor for detection.
-            detection_signal = filtered_finger_signal if self.sensor_type == 'finger' else filtered_wrist_signal
-            negative_detection_signal = -detection_signal 
+            combined = sorted([(i, "finger") for i in f_peaks] +
+                              [(i, "wrist")  for i in w_peaks],
+                              key=lambda x: x[0])
 
-            # Detect peaks and troughs using the internal _find_peaks method with the prominence.
-            peaks, _ = self._find_peaks(detection_signal, self.distance_sec)
-            troughs, _ = self._find_peaks(negative_detection_signal, self.distance_sec)
-            print(f"File {file_identifier}: Detected {len(peaks)} peaks and {len(troughs)} troughs.")
-
-            # Combine the detections into one sorted list with their type labels.
-            combined = sorted([(p, 'peak') for p in peaks] + [(t, 'trough') for t in troughs], key=lambda x: x[0])
             alternating = []
             for idx, typ in combined:
                 if not alternating or alternating[-1][1] != typ:
                     alternating.append((idx, typ))
+
+            i = 0
+            while i < len(alternating) - 1:
+                idx1, typ1 = alternating[i]
+                idx2, typ2 = alternating[i + 1]
+
+                if typ1 == "wrist" and typ2 == "finger":
+                    delta_samples = idx2 - idx1
+                    if 0 < delta_samples < max_delay_samples:
+                        # -------- convert to seconds -------------
+                        delta_sec = delta_samples / self.sampling_rate
+                        pwv_by_label[label].append(delta_sec)
+                    i += 2
                 else:
-                    continue
-            while alternating and alternating[0][1] != 'trough':
-                alternating.pop(0)
-            filtered_troughs = [pos for pos, typ in alternating if typ == 'trough']
+                    i += 1
 
-            # Optionally store intermediate results for further inspection.
-            self.wrist = filtered_wrist_signal
-            self.finger = filtered_finger_signal
-            self.troughs = filtered_troughs
-            self.peaks = peaks
+        return pwv_by_label
 
-            # Convert segment offset from seconds to samples.
-            offset_samples = int(self.segment_offset * self.sampling_rate)
-
-            parts = file_identifier.rsplit('_', 1)
-            if len(parts) == 2 and parts[1].isdigit():
-                label = parts[0]
-            else:
-                label = file_identifier
-
-            # Extract segments from one trough to the next.
-            for i in range(len(filtered_troughs) - 1):
-                # Compute the dynamic offset based on the interval between consecutive troughs.
-                interval_samples = filtered_troughs[i+1] - filtered_troughs[i]
-                dynamic_offset = int(self.segment_offset * interval_samples)
-                start_idx = max(filtered_troughs[i] - dynamic_offset, 0)
-                end_idx = min(filtered_troughs[i+1] - dynamic_offset, len(detection_signal))
-                wrist_segment = filtered_wrist_signal[start_idx:end_idx]
-                finger_segment = filtered_finger_signal[start_idx:end_idx]
-                original_len = len(wrist_segment)
-                resampled_factor = original_len / self.target_length
-                resampled_wrist = self._resample_signal(wrist_segment)
-                resampled_finger = self._resample_signal(finger_segment)
-                normalize_wrist = self._normalize_signal(resampled_wrist, self.normalize_wrist_factor)
-                normalize_finger = self._normalize_signal(resampled_finger, self.normalize_finger_factor)
-                # Combine both channels into a 2D segment with shape (L, 2)
-                segment = np.stack((normalize_wrist, normalize_finger), axis=-1)
-                self.segments.append(segment)
-                self.labels.append(label)
-                self.original_lengths.append(resampled_factor)
-
-        # --- Outlier removal by condition ---
-        # Group segments by label.
-        grouped_segments = defaultdict(list)
-        grouped_indices = defaultdict(list)
-        for idx, label in enumerate(self.labels):
-            grouped_segments[label].append(self.segments[idx])
-
-        filtered_segments = []
-        filtered_labels = []
-        for label, seg_list in grouped_segments.items():
-            seg_array = np.array(seg_list)  # shape: (N_segments, L, 2)
-            # Compute per-timepoint mean and std for each channel, for the given condition.
-            mean_wrist = np.mean(seg_array[:, :, 0], axis=0)  # shape: (L,)
-            std_wrist = np.std(seg_array[:, :, 0], axis=0)
-            mean_finger = np.mean(seg_array[:, :, 1], axis=0)
-            std_finger = np.std(seg_array[:, :, 1], axis=0)
-            # For each segment, check whether every data point is within [mean - 3*std, mean + 3*std]
-            for seg in seg_list:
-                wrist_ok = np.all((seg[:, 0] >= mean_wrist - 3*std_wrist) & (seg[:, 0] <= mean_wrist + 3*std_wrist))
-                finger_ok = np.all((seg[:, 1] >= mean_finger - 3*std_finger) & (seg[:, 1] <= mean_finger + 3*std_finger))
-                if wrist_ok and finger_ok:
-                    filtered_segments.append(seg)
-                    filtered_labels.append(label)
-        print(f"Outlier removal: retained {len(filtered_segments)} out of {len(self.segments)} segments.")
-        self.segments = filtered_segments
-        self.labels = filtered_labels
 
     def __len__(self):
         """Return the number of extracted segments."""
@@ -275,19 +313,8 @@ class HePPSDataset(Dataset):
         return sample, length, label
 
 if __name__ == '__main__':
-    # Define file paths and parameters (make sure these paths are correct)
-    file_identifiers = [
-        "rest",
-        "caffeine",
-        "deep_breath",
-        "hold_breath_1",
-        "hold_breath_2",
-        "exercise"
-    ]
-
     # Instantiate the dataset using your full segment extraction mode
     dataset = HePPSDataset(
-        file_identifiers=file_identifiers, 
         segment_offset=0,
         target_length=1024,
         filter_cutoff_wrist=[0.5, 20], 
@@ -299,5 +326,9 @@ if __name__ == '__main__':
     print(dataset.segments[idx].shape)
     print(dataset.labels[idx])
 
-    plt.plot(dataset.segments[idx])
-    plt.show()
+    # plt.plot(dataset.segments[idx])
+    # plt.show()
+
+    pwv_dict = dataset.compute_pwv()
+    for lab, deltas in pwv_dict.items():
+        print(f"{lab}:  n={len(deltas)}  mean delay={np.mean(deltas):.5f} seconds")

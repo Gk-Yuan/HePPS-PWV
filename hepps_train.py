@@ -5,6 +5,8 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from collections import Counter
 from tqdm import tqdm
+import matplotlib.pyplot as plt
+
 
 from hepps_dataset import HePPSDataset
 from hepps_model import HePPSMixed, HePPSGRU
@@ -23,9 +25,9 @@ def main():
         device = torch.device('cpu')
 
     # 2) Hyperparameters
-    BATCH_SIZE    = 32
-    NUM_EPOCHS    = 10
-    LEARNING_RATE = 1e-3
+    BATCH_SIZE    = 64
+    NUM_EPOCHS    = 100
+    LEARNING_RATE = 1e-4
 
     # 3) Dataset + DataLoader
     file_ids = [
@@ -73,7 +75,7 @@ def main():
     model = HePPSGRU(
         input_dim=1,
         hidden_dim=128,
-        layer_dim=2,
+        layer_dim=3,
         output_dim=5
     ).to(device)
 
@@ -91,6 +93,8 @@ def main():
     for name, param in model.named_parameters():
         print(f"Layer: {name}, Size: {param.size()}, Values: \n{param.data}\n")
 
+    epoch_losses = []
+    epoch_accs   = []
     # 6) Training loop
     for epoch in tqdm(range(1, NUM_EPOCHS + 1)):
         model.train()
@@ -132,6 +136,8 @@ def main():
         epoch_loss = total_loss / total
         epoch_acc  = 100 * correct / total
         tqdm.write(f"→ Epoch {epoch} done: Loss {epoch_loss:.4f}, Acc {epoch_acc:5.2f}%\n")
+        epoch_losses.append(epoch_loss)
+        epoch_accs.append(epoch_acc)
         scheduler.step(epoch_loss)
 
         # for name, param in model.named_parameters():
@@ -150,7 +156,21 @@ def main():
 
     # print them side by side
     for i, (t, p, pr) in enumerate(zip(labels, preds, probs.cpu().tolist())):
-        print(f"  Sample {i:2d} | true: {y_true:<2d} | pred: {p:<2d} | probs: {pr}")
+        print(f"  Sample {i:2d} | true: {t:15s} | pred: {p:<2d} | probs: {pr}")
+
+    epochs = list(range(1, len(epoch_losses) + 1))
+
+    fig, ax1 = plt.subplots()
+    ax1.plot(epochs, epoch_losses, color='tab:red', label='Loss')
+    ax1.set_xlabel('Epoch')
+    ax1.set_ylabel('Training Loss')
+
+    ax2 = ax1.twinx()
+    ax2.plot(epochs, epoch_accs, color='tab:blue', label='Accuracy')
+    ax2.set_ylabel('Training Accuracy (%)')
+
+    plt.title('Learning Curve')
+    plt.show()
 
 if __name__ == "__main__":
     main()
