@@ -22,7 +22,7 @@ class HePPSDataset(Dataset):
     For each file (specified by a file identifier such as "rest"), it:
       1. Constructs the full filename using the root directory (default: './data') and a fixed filename pattern.
       2. Loads the file and extracts the timestamps, wrist, and finger data.
-      3. Detects peaks (using the specified sensor for detection) via an internal _find_peaks method.
+      3. Detects peaks (using the specified sensor 2for detection) via an internal _find_peaks method.
       4. Extracts full segments from both sensors using a configurable offset from the detected peaks.
       
     Each segment is a 2D array of shape (L, 2), where L (which may vary) is the number of samples
