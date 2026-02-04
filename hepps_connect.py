@@ -172,7 +172,9 @@ def file_writer_process(file_queue, stop_event, participant_dir, session_timesta
     # Only create directory and file if we have data
     if received_batches:
         # Create participant directory structure only when we have data to save
-        os.makedirs(participant_dir, exist_ok=True)
+        # if the directory exists, do not create a new directory
+        if not os.path.exists(participant_dir):
+            os.makedirs(participant_dir, exist_ok=True)
         data_file_path = os.path.join(participant_dir, f"{session_timestamp}.csv")
         
         # Write all data to file in CSV format

@@ -37,14 +37,17 @@ class HEPPSBPDataset(Dataset):
                  distance_sec=0.4,
                  prominence=0.005,
                  filter_order=3,             # Restored original bandpass filter order
-                 filter_cutoff_wrist=[0.5, 20],    # Bandpass filter cutoffs for wrist [low, high]
-                 filter_cutoff_finger=[0.2, 30],   # Bandpass filter cutoffs for finger [low, high]
+                 filter_cutoff_wrist=[0.5, 10],    # Bandpass filter cutoffs for wrist [low, high]
+                 filter_cutoff_finger=[0.2, 10],   # Bandpass filter cutoffs for finger [low, high]
                  sensor='finger',            # Which sensor to use for peak/trough detection ('finger' or 'wrist')
                  segment_offset=0.0,
                  target_length=256,
-                 remove_after_resample=15,
+                 remove_after_resample=15,                 
                  normalize_finger_factor=1e5,
-                 normalize_wrist_factor =1e5,
+                 normalize_wrist_factor=1e5,
+                 outlier_threshold_wrist=0.018,
+                 outlier_threshold_finger=0.01,
+                 interpolation_length=None,     # Length for interpolation after resampling (None = no interpolation)
                  transform=None):
         self.root  = root
         self.fs    = target_fs            # uniform sampling rate (Hz)
@@ -54,11 +57,14 @@ class HEPPSBPDataset(Dataset):
         self.filter_cutoff_wrist = filter_cutoff_wrist   # Bandpass filter cutoffs for wrist [low, high]
         self.filter_cutoff_finger = filter_cutoff_finger # Bandpass filter cutoffs for finger [low, high]
         self.sensor = sensor.lower()        # Which sensor to use for peak/trough detection
-        self.segment_offset = segment_offset
+        self.segment_offset = segment_offset        
         self.target_len     = target_length
         self.rm_after       = remove_after_resample
         self.norm_finger_fac= normalize_finger_factor
         self.norm_wrist_fac = normalize_wrist_factor
+        self.outlier_threshold_wrist = outlier_threshold_wrist     # Outlier filtering threshold for wrist
+        self.outlier_threshold_finger = outlier_threshold_finger   # Outlier filtering threshold for finger
+        self.interpolation_length = interpolation_length           # Length for interpolation after resampling
         self.transform = transform
 
         # containers ----------------------------------------------------
@@ -215,13 +221,24 @@ class HEPPSBPDataset(Dataset):
         return filtfilt(b, a, x)
 
     def _find(self, x):               # wrapper: return peak indices
-        dist = int(self.distance_sec * self.fs)
+        dist = int(self.distance_sec * self.fs)        
         idx, _ = find_peaks(x, distance=dist, prominence=self.prominence)
         return idx
 
     def _resample(self, x):
         y = resample(x, self.target_len + self.rm_after)
         return y[self.rm_after//2 : self.rm_after//2 + self.target_len]
+    
+    def _interpolate(self, x):
+        """
+        Interpolate signal to specified length using linear interpolation.
+        """
+        if self.interpolation_length is None:
+            return x
+        
+        original_indices = np.linspace(0, len(x) - 1, len(x))
+        target_indices = np.linspace(0, len(x) - 1, self.interpolation_length)
+        return np.interp(target_indices, original_indices, x)
     
     def _ensure_alternating(self, peaks_a, peaks_b, tag_a='w', tag_b='f'):
         """
@@ -239,45 +256,61 @@ class HEPPSBPDataset(Dataset):
     
     def _normalize_by_label(self):
         """
-        Normalize segments per label: for each label, scale all its segments
-        so that the maximum absolute value across all segments equals 1.
+        Normalize segments per label and per channel: for each label, scale all its segments
+        so that the maximum absolute value for each channel equals 1.
         """
-        # CHANGED: compute max abs for each label across its segments
+        # compute max abs for each label and each channel across its segments
         max_per_label = {}
         for lab in set(self.labels):
             # indices for this label
             idxs = [i for i, l in enumerate(self.labels) if l == lab]
-            # global max abs value among those segments
-            max_val = max(np.max(np.abs(self.segments[i])) for i in idxs)
+            # max abs per channel among those segments
+            max_w = max(np.max(np.abs(self.segments[i][:, 0])) for i in idxs)
+            max_f = max(np.max(np.abs(self.segments[i][:, 1])) for i in idxs)
             # guard against zero or non-finite
-            if not np.isfinite(max_val) or max_val == 0:
-                max_val = 1.0
-            max_per_label[lab] = max_val
+            if not np.isfinite(max_w) or max_w == 0:
+                max_w = 1.0
+            if not np.isfinite(max_f) or max_f == 0:
+                max_f = 1.0
+            max_per_label[lab] = (max_w, max_f)
 
-        # CHANGED: apply per-label scaling
-        self.segments = [
-            seg / max_per_label[lab]
-            for seg, lab in zip(self.segments, self.labels)
-        ]
-
-    # ------------------------------------------------------------------
+        # apply per-label, per-channel scaling
+        scaled = []
+        for seg, lab in zip(self.segments, self.labels):
+            max_w, max_f = max_per_label[lab]
+            seg_scaled = seg.copy()
+            seg_scaled[:, 0] = seg_scaled[:, 0] / max_w
+            seg_scaled[:, 1] = seg_scaled[:, 1] / max_f
+            scaled.append(seg_scaled)
+        self.segments = scaled
+        # ------------------------------------------------------------------
     # segment extraction with alternating enforcement + normalisation
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------      
     def _extract_all_segments(self):
         for rec in self.raw_list:
-            # Apply outlier filtering before Butterworth filter with different thresholds
-            wrist_filtered = self._filter_outliers(rec['wrist'], threshold=0.005)   # 0.5% for wrist
-            finger_filtered = self._filter_outliers(rec['finger'], threshold=0.01) # 1.0% for finger
+            # Step 1: Apply outlier filtering with configurable thresholds
+            wrist_filtered = self._filter_outliers(rec['wrist'], threshold=self.outlier_threshold_wrist)
+            finger_filtered = self._filter_outliers(rec['finger'], threshold=self.outlier_threshold_finger)
             
-            # Apply Butterworth filter with different cutoff frequencies for wrist and finger
+            # Step 2: Apply Butterworth filter
             w_filt = self._butter(wrist_filtered, self.filter_cutoff_wrist)
             f_filt = self._butter(finger_filtered, self.filter_cutoff_finger)
-
-            # Use the specified sensor for peak/trough detection
+            
+            # Step 3: Resample the filtered signals
+            wrist_resampled = resample(w_filt, int(len(w_filt) * 0.8))  # Example resampling
+            finger_resampled = resample(f_filt, int(len(f_filt) * 0.8))
+            
+            # Step 4: Interpolate if interpolation_length is specified
+            wrist_interp = self._interpolate(wrist_resampled)
+            finger_interp = self._interpolate(finger_resampled)
+            
+            # Use processed signals for further processing
+            w_processed = wrist_interp
+            f_processed = finger_interp# Step 4: Use the specified sensor for peak/trough detection
             if self.sensor == 'finger':
-                detect_signal = f_filt
+                detect_signal = f_processed
             elif self.sensor == 'wrist':
-                detect_signal = w_filt
+                detect_signal = w_processed
             else:
                 raise ValueError(f"Invalid sensor '{self.sensor}'. Must be 'finger' or 'wrist'.")
             
@@ -289,8 +322,8 @@ class HEPPSBPDataset(Dataset):
                 continue
 
             for a, b in zip(troughs[:-1], troughs[1:]):
-                seg_w = w_filt[a:b]
-                seg_f = f_filt[a:b]
+                seg_w = w_processed[a:b]
+                seg_f = f_processed[a:b]
                 if len(seg_w) < 32:
                     continue
 
@@ -527,6 +560,20 @@ if __name__ == '__main__':
         plt.title(f"All finger segments for {label_to_plot}")
         plt.xlabel("Sample index")
         plt.ylabel("Normalized amplitude")
+        plt.show()
+
+        # Overlay wrist and finger (original + average) on the same plot
+        plt.figure()
+        for seg in segments:
+            plt.plot(seg[:, 0], alpha=0.25, c='lightcoral')  # wrist originals
+            plt.plot(seg[:, 1], alpha=0.25, c='lightblue')   # finger originals
+        avg_segment = np.mean(np.stack(segments, axis=0), axis=0)
+        plt.plot(avg_segment[:, 0], lw=2.5, c='darkred', label='Wrist avg')
+        plt.plot(avg_segment[:, 1], lw=2.5, c='darkblue', label='Finger avg')
+        plt.title(f"Wrist + Finger overlay for {label_to_plot}")
+        plt.xlabel("Sample index")
+        plt.ylabel("Normalized amplitude")
+        plt.legend()
         plt.show()
 
         # 3) Overlay SBP & DBP values

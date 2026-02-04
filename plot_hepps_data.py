@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-FILE_PATH = r'data\HEPPSBP\20251105_130421\gongkai.csv'
+FILE_PATH = r'data\HEPPSBP\gongkai\20260203_212849.csv'
 
 def filter_data_percentage(data, threshold=0.005):
     """
@@ -169,8 +169,8 @@ def plot_hepps_segment(csv_path, start_time=0, duration=10):
         duration (float): Duration to plot in seconds
     """
     data = pd.read_csv(csv_path)    # Apply filtering to both channels with percentage thresholds
-    ain0_threshold = 0.005  # 0.5% for AIN0 (wrist)
-    ain1_threshold = 0.01   # 1.0% for AIN1 (finger) - can be adjusted
+    ain0_threshold = 0.018  # 0.5% for AIN0 (wrist)
+    ain1_threshold = 0.01   # 1.0% for AIN1 (finger)
     
     print(f"Applying percentage-based filtering - AIN0: {ain0_threshold*100:.1f}%, AIN1: {ain1_threshold*100:.1f}%...")
     data['ain0_filtered'] = filter_data_percentage(data['ain0'], threshold=ain0_threshold)
