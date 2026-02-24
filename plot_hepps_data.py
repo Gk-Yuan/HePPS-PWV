@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.signal import butter, filtfilt
 
-FILE_PATH = r'data\HEPPSBP\gongkai\20260203_212849.csv'
+FILE_PATH = r'data\HEPPSBP\Changxin\20260218_125104.csv'
 
 def filter_data_percentage(data, threshold=0.005):
     """

@@ -20,11 +20,12 @@ class HEPPSBPDataset(Dataset):
         │   └── 20251106_142315.csv
         ├── ParticipantName2/
         │   └── 20251105_135542.csv
-        └── metadata_super.csv   (columns: Name, SBP1, SBP2, SBP3, DBP1, DBP2, DBP3, ...)
+        └── metadata_super.csv   (columns: Name, time, SBP1, DBP1, ...)
 
     * Each .csv has three columns: timestamp, ain0, ain1
     * The folder name is the participant name/label
-    * SBP/DBP values are looked up from metadata_super.csv via the Name column
+    * SBP/DBP values are looked up from metadata_super.csv via (Name, time)
+      where time matches each CSV filename stem (YYYYMMDD_HHMMSS)
     * Signals are **interpolated** onto a uniform grid (`target_fs` Hz)
     """
 
@@ -47,6 +48,8 @@ class HEPPSBPDataset(Dataset):
                  normalize_wrist_factor=1e5,
                  outlier_threshold_wrist=0.018,
                  outlier_threshold_finger=0.01,
+                 bp_sample_ratio=0.05,       # sample BP within value +/- (value * ratio)
+                 peak_distance_max=50,       # max allowed |wrist_peak - finger_peak| (samples)
                  interpolation_length=None,     # Length for interpolation after resampling (None = no interpolation)
                  transform=None):
         self.root  = root
@@ -64,6 +67,8 @@ class HEPPSBPDataset(Dataset):
         self.norm_wrist_fac = normalize_wrist_factor
         self.outlier_threshold_wrist = outlier_threshold_wrist     # Outlier filtering threshold for wrist
         self.outlier_threshold_finger = outlier_threshold_finger   # Outlier filtering threshold for finger
+        self.bp_sample_ratio = bp_sample_ratio
+        self.peak_distance_max = peak_distance_max
         self.interpolation_length = interpolation_length           # Length for interpolation after resampling
         self.transform = transform
 
@@ -89,18 +94,16 @@ class HEPPSBPDataset(Dataset):
         csv_path = os.path.join(self.root, 'metadata_super.csv')
         meta = pd.read_csv(
             csv_path,
-            usecols=['Name', 'SBP1', 'SBP2', 'SBP3', 'DBP1', 'DBP2', 'DBP3']
+            usecols=['Name', 'time', 'SBP1', 'DBP1']
         )
-        # build lookup dicts: Name -> [SBP1, SBP2, SBP3]
-        self.sbp_map = {
-            row['Name']: [row['SBP1'], row['SBP2'], row['SBP3']]
-            for _, row in meta.iterrows()
-        }
-        # build lookup dicts: Name -> [DBP1, DBP2, DBP3]
-        self.dbp_map = {
-            row['Name']: [row['DBP1'], row['DBP2'], row['DBP3']]
-            for _, row in meta.iterrows()
-        }
+        # Build lookup dict: (Name, time) -> (SBP1, DBP1)
+        self.bp_map = {}
+        for _, row in meta.iterrows():
+            name = str(row['Name']).strip().lower()
+            session_time = str(row['time']).strip()
+            sbp = pd.to_numeric(row['SBP1'], errors='coerce')
+            dbp = pd.to_numeric(row['DBP1'], errors='coerce')
+            self.bp_map[(name, session_time)] = (sbp, dbp)
 
         # --- scan participant folders for *.csv files ------------------
         # New structure: data/HEPPSBP/ParticipantName/YYYYMMDD_HHMMSS.csv
@@ -122,14 +125,19 @@ class HEPPSBPDataset(Dataset):
         for path in csv_paths:
             try:
                 raw = pd.read_csv(path)
-                # Extract participant name from folder name
+                # Extract participant name from folder name and time from file name
                 participant_name = os.path.basename(os.path.dirname(path))
-                sbp_vals = self.sbp_map.get(participant_name, [np.nan]*3)
-                dbp_vals = self.dbp_map.get(participant_name, [np.nan]*3)
+                session_time = os.path.splitext(os.path.basename(path))[0]
+                sbp_vals, dbp_vals = self.bp_map.get((participant_name.lower(), session_time), (np.nan, np.nan))
+                if not np.isfinite(float(sbp_vals)) or not np.isfinite(float(dbp_vals)):
+                    print(
+                        f"Warning: No metadata match for Name='{participant_name}', "
+                        f"time='{session_time}' in metadata_super.csv"
+                    )
                 
                 t      = raw['timestamp'].values    # seconds
-                wrist  = raw['ain0'].values         # ain0 is wrist
-                finger = raw['ain1'].values         # ain1 is finger
+                wrist  = raw['ain1'].values         # ain1 is wrist
+                finger = raw['ain0'].values         # ain0 is finger
 
                 # --- interpolate onto uniform grid --------------------
                 new_t = np.arange(t[0], t[-1], 1/self.fs)
@@ -155,30 +163,21 @@ class HEPPSBPDataset(Dataset):
     # helpers
     # ------------------------------------------------------------------
 
-    def _sample_bp(self, values):
+    def _sample_bp(self, value):
         """
-        Sample a random BP between (min(values) - sd) and (max(values) + sd),
-        with guards against non-finite or overflow bounds.
+        Sample a random BP from value ± (value * self.bp_sample_ratio).
         """
-        arr = np.array(values, dtype=np.float64)
-        low, high = np.nanmin(arr), np.nanmax(arr)      
-        sd = np.nanstd(arr)                             
-        lower, upper = low - sd, high + sd         
+        bp = float(value)
+        if not np.isfinite(bp):
+            return bp
 
-        # ensure bounds are finite
-        if not np.isfinite(lower):
-            lower = low
-        if not np.isfinite(upper):
-            upper = high
+        ratio = abs(float(self.bp_sample_ratio))
+        lower = bp * (1.0 - ratio)
+        upper = bp * (1.0 + ratio)
+        if lower > upper:
+            lower, upper = upper, lower
 
-        # if range is invalid, fall back to mean
-        if lower >= upper:
-            return float(arr.mean())
-
-        try:
-            return float(np.random.uniform(lower, upper))
-        except OverflowError:
-            return float(arr.mean())
+        return float(np.random.uniform(lower, upper))
     
     def _filter_outliers(self, data, threshold=0.005):
         """
@@ -253,36 +252,80 @@ class HEPPSBPDataset(Dataset):
             if not altern or altern[-1][1] != typ:
                 altern.append((idx, typ))
         return altern
-    
-    def _normalize_by_label(self):
-        """
-        Normalize segments per label and per channel: for each label, scale all its segments
-        so that the maximum absolute value for each channel equals 1.
-        """
-        # compute max abs for each label and each channel across its segments
-        max_per_label = {}
-        for lab in set(self.labels):
-            # indices for this label
-            idxs = [i for i, l in enumerate(self.labels) if l == lab]
-            # max abs per channel among those segments
-            max_w = max(np.max(np.abs(self.segments[i][:, 0])) for i in idxs)
-            max_f = max(np.max(np.abs(self.segments[i][:, 1])) for i in idxs)
-            # guard against zero or non-finite
-            if not np.isfinite(max_w) or max_w == 0:
-                max_w = 1.0
-            if not np.isfinite(max_f) or max_f == 0:
-                max_f = 1.0
-            max_per_label[lab] = (max_w, max_f)
 
-        # apply per-label, per-channel scaling
-        scaled = []
-        for seg, lab in zip(self.segments, self.labels):
-            max_w, max_f = max_per_label[lab]
-            seg_scaled = seg.copy()
-            seg_scaled[:, 0] = seg_scaled[:, 0] / max_w
-            seg_scaled[:, 1] = seg_scaled[:, 1] / max_f
-            scaled.append(seg_scaled)
-        self.segments = scaled
+    def _is_valid_peak_distance(self, seg_w, seg_f):
+        """
+        Keep segment only when wrist and finger peak locations are close enough.
+        """
+        wrist_peaks = self._find(seg_w)
+        finger_peaks = self._find(seg_f)
+        if len(wrist_peaks) == 0 or len(finger_peaks) == 0:
+            return False
+
+        # Minimum distance between any wrist peak and any finger peak
+        min_dist = np.min(np.abs(wrist_peaks[:, None] - finger_peaks[None, :]))
+        return bool(min_dist <= self.peak_distance_max)
+
+    # def _normalize_by_label(self):
+    #     """
+    #     Normalize segments per label and per channel: for each label, scale all its segments
+    #     so that the maximum absolute value for each channel equals 1.
+    #     """
+    #     # compute max abs for each label and each channel across its segments
+    #     max_per_label = {}
+    #     for lab in set(self.labels):
+    #         # indices for this label
+    #         idxs = [i for i, l in enumerate(self.labels) if l == lab]
+    #         # max abs per channel among those segments
+    #         max_w = max(np.max(np.abs(self.segments[i][:, 0])) for i in idxs)
+    #         max_f = max(np.max(np.abs(self.segments[i][:, 1])) for i in idxs)
+    #         # guard against zero or non-finite
+    #         if not np.isfinite(max_w) or max_w == 0:
+    #             max_w = 1.0
+    #         if not np.isfinite(max_f) or max_f == 0:
+    #             max_f = 1.0
+    #         max_per_label[lab] = (max_w, max_f)
+
+    #     # apply per-label, per-channel scaling
+    #     scaled = []
+    #     for seg, lab in zip(self.segments, self.labels):
+    #         max_w, max_f = max_per_label[lab]
+    #         seg_scaled = seg.copy()
+    #         seg_scaled[:, 0] = seg_scaled[:, 0] / max_w
+    #         seg_scaled[:, 1] = seg_scaled[:, 1] / max_f
+    #         scaled.append(seg_scaled)
+    #     self.segments = scaled
+
+    def _normalize_and_flip_segments(self):
+        """
+        For each segment and each channel (wrist, finger):
+        1) min-max normalize to [-1, 1]
+        2) flip sign so -1 -> 1 and 1 -> -1
+        """
+        def norm_flip_channel(x):
+            arr = np.asarray(x, dtype=np.float64)
+            if arr.size == 0:
+                return arr
+            mask = np.isfinite(arr)
+            if not np.any(mask):
+                return arr
+            vmin = np.min(arr[mask])
+            vmax = np.max(arr[mask])
+            out = arr.copy()
+            if vmax > vmin:
+                out[mask] = 2.0 * (arr[mask] - vmin) / (vmax - vmin) - 1.0
+            else:
+                out[mask] = 0.0
+            out[mask] = -out[mask]
+            return out
+
+        normalized = []
+        for seg in self.segments:
+            seg_arr = np.asarray(seg, dtype=np.float64).copy()
+            seg_arr[:, 0] = norm_flip_channel(seg_arr[:, 0])  # wrist
+            seg_arr[:, 1] = norm_flip_channel(seg_arr[:, 1])  # finger
+            normalized.append(seg_arr)
+        self.segments = normalized
         # ------------------------------------------------------------------
     # segment extraction with alternating enforcement + normalisation
     # ------------------------------------------------------------------      
@@ -317,23 +360,25 @@ class HEPPSBPDataset(Dataset):
             tr   = self._find(-detect_signal)    # troughs
             pk   = self._find(detect_signal)     # peaks
             alt  = self._ensure_alternating(pk, tr, 'p', 't')
-            troughs = [idx for idx, typ in alt if typ == 't']
-            if len(troughs) < 2:
+            peaks = [idx for idx, typ in alt if typ == 'p']
+            if len(peaks) < 2:
                 continue
 
-            for a, b in zip(troughs[:-1], troughs[1:]):
+            for a, b in zip(peaks[:-1], peaks[1:]):
                 seg_w = w_processed[a:b]
                 seg_f = f_processed[a:b]
                 if len(seg_w) < 32:
                     continue
-
                 seg_w = self._resample(seg_w)
                 seg_f = self._resample(seg_f)
-                
+                if not self._is_valid_peak_distance(seg_w, seg_f):
+                    continue
+
                 segment = np.stack((seg_w, seg_f), -1)
 
-                sbp = self._sample_bp(rec['sbp_vals']) 
-                dbp = self._sample_bp(rec['dbp_vals'])
+                # Keep original metadata targets (SBP1/DBP1) without jitter.
+                sbp = float(rec['sbp_vals'])
+                dbp = float(rec['dbp_vals'])
                 self.segments.append(segment)
                 self.labels.append(rec['label'])
                 self.sbp_list.append(sbp) 
@@ -345,7 +390,8 @@ class HEPPSBPDataset(Dataset):
         print(f"Total segments before outlier removal: {len(self.original_segments)}")
         
         self._remove_outliers()           # <<< 3-σ filtering at the end
-        self._normalize_by_label()
+        self._normalize_and_flip_segments()
+        # self._normalize_by_label()
 
     # ------------------------------------------------------------------
     # 3-sigma outlier removal per label
@@ -512,14 +558,12 @@ class HEPPSBPDataset(Dataset):
         return x, sbp, dbp
     
 if __name__ == '__main__':
-    ds = HEPPSBPDataset(
-        sensor='wrist'
-    )
+    ds = HEPPSBPDataset()
     print(len(ds), "segments")
     
     # Visualize all original segments before outlier removal
-    print("\nVisualizing all original segments before outlier removal:")
-    ds.plot_all_original_segments()
+    # print("\nVisualizing all original segments before outlier removal:")
+    # ds.plot_all_original_segments()
     
     # Continue with regular analysis
     idx = 0
@@ -534,7 +578,7 @@ if __name__ == '__main__':
     # for lab, d in pwv.items():
     #     print(lab, "mean dt =", np.mean(d), "s")
 
-    label_to_plot = 'gongkai'
+    label_to_plot = 'Changxin'
     
     # Collect all segments for that label
     segments = [seg for seg, lab in zip(ds.segments, ds.labels) if lab == label_to_plot]

@@ -96,8 +96,8 @@ def get_blood_pressure_input():
         print("Invalid input. Using default values.")
         return int(default_sbp), int(default_dbp)
 
-def update_metadata_csv(name, sbp, dbp):
-    """Update or add entry to metadata CSV file"""
+def update_metadata_csv(name, session_timestamp, sbp, dbp):
+    """Append one metadata row per recording session (Name + time)."""
     try:
         # Ensure the directory exists
         os.makedirs(os.path.dirname(METADATA_FILE), exist_ok=True)
@@ -107,41 +107,32 @@ def update_metadata_csv(name, sbp, dbp):
             df = pd.read_csv(METADATA_FILE)
         else:
             # Create new DataFrame with the expected columns
-            columns = ['ID', 'Name', 'Age', 'Sex', 'Height', 'Weight', 'Arm Span', 'Leg Length', 
+            columns = ['ID', 'Name', 'time', 'Age', 'Sex', 'Height', 'Weight', 'Arm Span', 'Leg Length',
                       'SBP', 'DBP', 'bpHR', 'vPTT', 'vPWV', 'vHR', 'PTT', 'HR', 
                       'SBP1', 'DBP1', 'HR1', 'SBP2', 'DBP2', 'HR2', 'SBP3', 'DBP3', 'HR3']
             df = pd.DataFrame(columns=columns)
-        
-        # Check if name already exists
-        name_exists = df['Name'].str.lower() == name.lower()
-        
-        if name_exists.any():
-            # Update existing entry
-            idx = df[name_exists].index[0]
-            df.loc[idx, 'SBP1'] = sbp
-            df.loc[idx, 'SBP2'] = sbp
-            df.loc[idx, 'SBP3'] = sbp
-            df.loc[idx, 'DBP1'] = dbp
-            df.loc[idx, 'DBP2'] = dbp
-            df.loc[idx, 'DBP3'] = dbp
-            print(f"Updated blood pressure for existing entry: {name}")
-        else:
-            # Add new entry
-            new_id = df['ID'].max() + 1 if not df.empty and df['ID'].notna().any() else 1
-            new_row = {
-                'ID': new_id,
-                'Name': name,
-                'SBP1': sbp,
-                'SBP2': sbp,
-                'SBP3': sbp,
-                'DBP1': dbp,
-                'DBP2': dbp,
-                'DBP3': dbp
-            }
-            # Convert new_row to DataFrame and concatenate
-            new_row_df = pd.DataFrame([new_row])
-            df = pd.concat([df, new_row_df], ignore_index=True)
-            print(f"Added new entry for: {name}")
+
+        # Backfill the session key column if metadata existed without it
+        if 'time' not in df.columns:
+            df.insert(2, 'time', '')
+
+        # Add new entry (append-only; no overwrite)
+        new_id = df['ID'].max() + 1 if not df.empty and df['ID'].notna().any() else 1
+        new_row = {
+            'ID': new_id,
+            'Name': name,
+            'time': session_timestamp,
+            'SBP1': sbp,
+            'SBP2': sbp,
+            'SBP3': sbp,
+            'DBP1': dbp,
+            'DBP2': dbp,
+            'DBP3': dbp
+        }
+        # Convert new_row to DataFrame and concatenate
+        new_row_df = pd.DataFrame([new_row])
+        df = pd.concat([df, new_row_df], ignore_index=True)
+        print(f"Appended metadata row for: {name}, time={session_timestamp}")
         
         # Save the updated DataFrame
         df.to_csv(METADATA_FILE, index=False)
@@ -150,7 +141,7 @@ def update_metadata_csv(name, sbp, dbp):
     except Exception as e:
         print(f"Error updating metadata CSV: {e}")
 
-def file_writer_process(file_queue, stop_event, participant_dir, session_timestamp, start_recording_event):
+def file_writer_process(file_queue, stop_event, participant_dir, session_timestamp, start_recording_event, data_saved_event):
     """Process for writing data to file"""
     received_batches = []
     start_time = None
@@ -205,6 +196,7 @@ def file_writer_process(file_queue, stop_event, participant_dir, session_timesta
                     f.write(f"{relative_timestamp:.6f},{ain0_data[j]},{ain1_data[j]}\n")
         
         print(f"Data saved to {data_file_path}")
+        data_saved_event.set()
     else:
         print("No data received - no file created")
 
@@ -332,7 +324,7 @@ def plotting_process(plot_queue, stop_event, start_recording_event, manual_stop_
                 break
         
         ax.cla()
-        ax.plot(list(local_ain0), label="AIN0")
+        # ax.plot(list(local_ain0), label="AIN0")
         ax.plot(list(local_ain1), label="AIN1")
         ax.set_xlabel("Sample Index")
         ax.set_ylabel("ADC Value")
@@ -372,11 +364,12 @@ def main():
     stop_event = mp.Event()
     start_recording_event = mp.Event()  # Event to control recording start
     manual_stop_event = mp.Event()      # Event for manual stop button
+    data_saved_event = mp.Event()       # Event set only when a session CSV is written
     
     # Create processes
     ble_proc = mp.Process(target=ble_process, args=(plot_queue, file_queue, stop_event, start_recording_event, manual_stop_event))
     plot_proc = mp.Process(target=plotting_process, args=(plot_queue, stop_event, start_recording_event, manual_stop_event))
-    file_proc = mp.Process(target=file_writer_process, args=(file_queue, stop_event, participant_dir, session_timestamp, start_recording_event))
+    file_proc = mp.Process(target=file_writer_process, args=(file_queue, stop_event, participant_dir, session_timestamp, start_recording_event, data_saved_event))
     
     # Start processes
     ble_proc.start()
@@ -399,8 +392,11 @@ def main():
     
     # After all processes complete, ask for blood pressure input
     print("\nData collection completed.")
-    sbp, dbp = get_blood_pressure_input()
-    update_metadata_csv(participant_name, sbp, dbp)
+    if data_saved_event.is_set():
+        sbp, dbp = get_blood_pressure_input()
+        update_metadata_csv(participant_name, session_timestamp, sbp, dbp)
+    else:
+        print("No session file saved, skipping metadata update.")
     
     print("All processes completed.")
 
