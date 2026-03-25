@@ -1,4 +1,4 @@
-# hepps_bp_dataset.py
+﻿# hepps_bp_dataset.py
 import os, glob
 from collections import defaultdict
 from enum import Enum
@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from scipy.signal import find_peaks, butter, sosfiltfilt, resample, filtfilt
+from scipy.signal import find_peaks, butter, sosfiltfilt, resample, filtfilt, savgol_filter
 import matplotlib.pyplot as plt
 
 class HEPPSBPDataset(Dataset):
@@ -48,6 +48,11 @@ class HEPPSBPDataset(Dataset):
                  normalize_wrist_factor=1e5,
                  outlier_threshold_wrist=0.018,
                  outlier_threshold_finger=0.01,
+                 savgol_window_length=11,
+                 savgol_polyorder=3,
+                 peak_index_min=30,
+                 peak_index_max=100,
+                 require_both_peak_range=False,
                  bp_sample_ratio=0.05,       # sample BP within value +/- (value * ratio)
                  peak_distance_max=50,       # max allowed |wrist_peak - finger_peak| (samples)
                  interpolation_length=None,     # Length for interpolation after resampling (None = no interpolation)
@@ -67,6 +72,11 @@ class HEPPSBPDataset(Dataset):
         self.norm_wrist_fac = normalize_wrist_factor
         self.outlier_threshold_wrist = outlier_threshold_wrist     # Outlier filtering threshold for wrist
         self.outlier_threshold_finger = outlier_threshold_finger   # Outlier filtering threshold for finger
+        self.savgol_window_length = int(savgol_window_length)
+        self.savgol_polyorder = int(savgol_polyorder)
+        self.peak_index_min = int(peak_index_min)
+        self.peak_index_max = int(peak_index_max)
+        self.require_both_peak_range = self._to_bool(require_both_peak_range)
         self.bp_sample_ratio = bp_sample_ratio
         self.peak_distance_max = peak_distance_max
         self.interpolation_length = interpolation_length           # Length for interpolation after resampling
@@ -165,7 +175,7 @@ class HEPPSBPDataset(Dataset):
 
     def _sample_bp(self, value):
         """
-        Sample a random BP from value ± (value * self.bp_sample_ratio).
+        Sample a random BP from value Â± (value * self.bp_sample_ratio).
         """
         bp = float(value)
         if not np.isfinite(bp):
@@ -204,7 +214,44 @@ class HEPPSBPDataset(Dataset):
                     filtered_data[i] = prev_val
                     
         return filtered_data
+
+    @staticmethod
+    def _to_bool(value):
+        """
+        Parse common bool representations robustly (e.g., "true"/"false", 1/0).
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, np.integer)):
+            return bool(value)
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in {'1', 'true', 't', 'yes', 'y', 'on'}:
+                return True
+            if v in {'0', 'false', 'f', 'no', 'n', 'off', ''}:
+                return False
+        return bool(value)
     
+    def _savgol(self, x):
+        """
+        Apply Savitzky-Golay smoothing with safe adjustment for short signals.
+        """
+        n = len(x)
+        if n < 3:
+            return x
+
+        win = min(self.savgol_window_length, n)
+        if win % 2 == 0:
+            win -= 1
+        if win < 3:
+            return x
+
+        poly = min(self.savgol_polyorder, win - 1)
+        if poly < 1:
+            return x
+
+        return savgol_filter(x, window_length=win, polyorder=poly)
+
     def _butter(self, x, filter_cutoff):
         """
         Apply Butterworth bandpass filter with specified cutoff frequencies
@@ -326,6 +373,53 @@ class HEPPSBPDataset(Dataset):
             seg_arr[:, 1] = norm_flip_channel(seg_arr[:, 1])  # finger
             normalized.append(seg_arr)
         self.segments = normalized
+
+    def _keep_segments_with_peak_in_range(self):
+        """
+        Keep only segments whose main peak index is within [peak_index_min, peak_index_max].
+        If require_both_peak_range=True, both wrist and finger must pass.
+        Otherwise, only the channel selected by `self.sensor` is checked.
+        """
+        if not self.segments:
+            return
+
+        channel_idx = 1 if self.sensor == 'finger' else 0
+        lo = self.peak_index_min
+        hi = self.peak_index_max
+        if lo > hi:
+            lo, hi = hi, lo
+
+        kept_idx = []
+        for i, seg in enumerate(self.segments):
+            seg_arr = np.asarray(seg)
+            if self.require_both_peak_range:
+                wrist_sig = seg_arr[:, 0]
+                finger_sig = seg_arr[:, 1]
+                wrist_peaks = self._find(wrist_sig)
+                finger_peaks = self._find(finger_sig)
+                if len(wrist_peaks) == 0 or len(finger_peaks) == 0:
+                    continue
+
+                wrist_main_peak = int(wrist_peaks[np.argmax(wrist_sig[wrist_peaks])])
+                finger_main_peak = int(finger_peaks[np.argmax(finger_sig[finger_peaks])])
+                if (lo <= wrist_main_peak <= hi) and (lo <= finger_main_peak <= hi):
+                    kept_idx.append(i)
+            else:
+                sig = seg_arr[:, channel_idx]
+                peaks = self._find(sig)
+                if len(peaks) == 0:
+                    continue
+
+                main_peak = int(peaks[np.argmax(sig[peaks])])
+                if lo <= main_peak <= hi:
+                    kept_idx.append(i)
+
+        start_n = len(self.segments)
+        self.segments = [self.segments[i] for i in kept_idx]
+        self.labels = [self.labels[i] for i in kept_idx]
+        self.sbp_list = [self.sbp_list[i] for i in kept_idx]
+        self.dbp_list = [self.dbp_list[i] for i in kept_idx]
+        print(f"Peak-index filter [{lo}, {hi}]: kept {len(self.segments)}/{start_n} segments.")
         # ------------------------------------------------------------------
     # segment extraction with alternating enforcement + normalisation
     # ------------------------------------------------------------------      
@@ -335,15 +429,19 @@ class HEPPSBPDataset(Dataset):
             wrist_filtered = self._filter_outliers(rec['wrist'], threshold=self.outlier_threshold_wrist)
             finger_filtered = self._filter_outliers(rec['finger'], threshold=self.outlier_threshold_finger)
             
-            # Step 2: Apply Butterworth filter
-            w_filt = self._butter(wrist_filtered, self.filter_cutoff_wrist)
-            f_filt = self._butter(finger_filtered, self.filter_cutoff_finger)
+            # Step 2: Apply Savitzky-Golay smoothing before Butterworth filter
+            wrist_smoothed = self._savgol(wrist_filtered)
+            finger_smoothed = self._savgol(finger_filtered)
             
-            # Step 3: Resample the filtered signals
+            # Step 3: Apply Butterworth filter
+            w_filt = self._butter(wrist_smoothed, self.filter_cutoff_wrist)
+            f_filt = self._butter(finger_smoothed, self.filter_cutoff_finger)
+            
+            # Step 4: Resample the filtered signals
             wrist_resampled = resample(w_filt, int(len(w_filt) * 0.8))  # Example resampling
             finger_resampled = resample(f_filt, int(len(f_filt) * 0.8))
             
-            # Step 4: Interpolate if interpolation_length is specified
+            # Step 5: Interpolate if interpolation_length is specified
             wrist_interp = self._interpolate(wrist_resampled)
             finger_interp = self._interpolate(finger_resampled)
             
@@ -389,8 +487,9 @@ class HEPPSBPDataset(Dataset):
         self.original_labels = self.labels.copy()
         print(f"Total segments before outlier removal: {len(self.original_segments)}")
         
-        self._remove_outliers()           # <<< 3-σ filtering at the end
+        self._remove_outliers()           # <<< 3-Ïƒ filtering at the end
         self._normalize_and_flip_segments()
+        self._keep_segments_with_peak_in_range()
         # self._normalize_by_label()
 
     # ------------------------------------------------------------------
@@ -398,7 +497,7 @@ class HEPPSBPDataset(Dataset):
     # ------------------------------------------------------------------
     def _remove_outliers(self):
         """
-        Remove segments that are >3σ from the mean, computed separately for each label.
+        Remove segments that are >3Ïƒ from the mean, computed separately for each label.
         """
         # group indices (not raw segments) by label
         grouped_idx = defaultdict(list)
@@ -408,7 +507,7 @@ class HEPPSBPDataset(Dataset):
         num_seg = len(self.segments)
 
         kept_idx = []
-        # for each label, compute μ and σ over its own segments
+        # for each label, compute Î¼ and Ïƒ over its own segments
         for lab, idxs in grouped_idx.items():
             arr = np.stack([self.segments[i] for i in idxs], axis=0)  # shape (N, L, 2)
             mu  = arr.mean(axis=0)
@@ -429,92 +528,9 @@ class HEPPSBPDataset(Dataset):
 
         print(f"Outlier removal: started with {num_seg} segments, "
             f"kept {len(self.segments)} segments.")
-
-    # ------------------------------------------------------------------
-    # Visualization methods
-    # ------------------------------------------------------------------
-    def plot_all_original_segments(self, label_filter=None, max_plots_per_row=6):
-        """
-        Plot all original segments (before outlier removal) in a grid layout.
-        
-        Args:
-            label_filter (str): If specified, only plot segments for this label
-            max_plots_per_row (int): Maximum number of plots per row
-        """
-        segments_to_plot = []
-        labels_to_plot = []
-        
-        if label_filter:
-            for i, lab in enumerate(self.original_labels):
-                if lab == label_filter:
-                    segments_to_plot.append(self.original_segments[i])
-                    labels_to_plot.append(lab)
-        else:
-            segments_to_plot = self.original_segments
-            labels_to_plot = self.original_labels
-        
-        if not segments_to_plot:
-            print(f"No segments found for label: {label_filter}")
-            return
-            
-        n_segments = len(segments_to_plot)
-        n_cols = min(max_plots_per_row, n_segments)
-        n_rows = (n_segments + n_cols - 1) // n_cols
-        
-        # Create subplots for wrist channel
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3*n_rows))
-        if n_segments == 1:
-            axes = [axes]
-        elif n_rows == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten()
-            
-        fig.suptitle(f'All Wrist Segments Before Outlier Removal ({n_segments} segments)', fontsize=16)
-        
-        for i, (segment, label) in enumerate(zip(segments_to_plot, labels_to_plot)):
-            if i < len(axes):
-                axes[i].plot(segment[:, 0], color='tab:red', linewidth=1)
-                axes[i].set_title(f'{label} - Segment {i+1}')
-                axes[i].set_xlabel('Sample index')
-                axes[i].set_ylabel('Amplitude')
-                axes[i].grid(True, alpha=0.3)
-        
-        # Hide empty subplots
-        for i in range(n_segments, len(axes)):
-            axes[i].set_visible(False)
-            
-        plt.tight_layout()
-        plt.show()
-        
-        # Create subplots for finger channel
-        fig, axes = plt.subplots(n_rows, n_cols, figsize=(4*n_cols, 3*n_rows))
-        if n_segments == 1:
-            axes = [axes]
-        elif n_rows == 1:
-            axes = [axes]
-        else:
-            axes = axes.flatten()
-            
-        fig.suptitle(f'All Finger Segments Before Outlier Removal ({n_segments} segments)', fontsize=16)
-        
-        for i, (segment, label) in enumerate(zip(segments_to_plot, labels_to_plot)):
-            if i < len(axes):
-                axes[i].plot(segment[:, 1], color='tab:blue', linewidth=1)
-                axes[i].set_title(f'{label} - Segment {i+1}')
-                axes[i].set_xlabel('Sample index')
-                axes[i].set_ylabel('Amplitude')
-                axes[i].grid(True, alpha=0.3)
-        
-        # Hide empty subplots
-        for i in range(n_segments, len(axes)):
-            axes[i].set_visible(False)
-            
-        plt.tight_layout()
-        plt.show()
         
     # ------------------------------------------------------------------
-    # PWV (raw, unfiltered)  — same logic as earlier but time-based
+    # PWV (raw, unfiltered)  â€” same logic as earlier but time-based
     # ------------------------------------------------------------------
     def compute_pwv(self, max_delay=0.10):
         out = defaultdict(list)
@@ -561,10 +577,6 @@ if __name__ == '__main__':
     ds = HEPPSBPDataset()
     print(len(ds), "segments")
     
-    # Visualize all original segments before outlier removal
-    # print("\nVisualizing all original segments before outlier removal:")
-    # ds.plot_all_original_segments()
-    
     # Continue with regular analysis
     idx = 0
     print(f"\nFirst segment shape: {ds.segments[idx].shape}")
@@ -578,7 +590,7 @@ if __name__ == '__main__':
     # for lab, d in pwv.items():
     #     print(lab, "mean dt =", np.mean(d), "s")
 
-    label_to_plot = 'Changxin'
+    label_to_plot = 'gongkai'
     
     # Collect all segments for that label
     segments = [seg for seg, lab in zip(ds.segments, ds.labels) if lab == label_to_plot]
